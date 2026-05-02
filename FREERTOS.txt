@@ -1,0 +1,181 @@
+// ============================================================
+// ROV (Remotely Operated Vehicle) - FreeRTOS Sensor System
+// Platform : Arduino / ESP32
+// RTOS     : FreeRTOS
+// ============================================================
+ 
+#include "FreeRTOS.h"
+#include "task.h"
+#include "semphr.h"
+ 
+// ── Synchronization primitives ───────────────────────────────
+SemaphoreHandle_t xDepthSemaphore; // Counting semaphore: waits for all sensors to be ready
+SemaphoreHandle_t xDataMutex;      // Mutex: protects shared resources (Serial port, global vars)
+ 
+// ── Sensor data packet ───────────────────────────────────────
+// All inter-task communication uses this structure
+struct SensorPacket {
+    int   sensorID; // 1: Depth | 2: Pressure | 3: Temperature
+    float value;    // Measured sensor reading
+};
+ 
+// ── Message queue ────────────────────────────────────────────
+QueueHandle_t xROVQueue; // Sensor tasks → Motor_Control_Task
+ 
+// ── Shared global variables (protected by xDataMutex) ────────
+int   sensorValue    = 0;
+float pressureData   = 0.0f;
+float temperatureData = 0.0f;
+ 
+ 
+// ============================================================
+// TASK 1 — Depth_Sensor_Task
+// Periodic task: reads depth sensor every 2 seconds and
+// pushes a SensorPacket to the queue.
+// Gives one semaphore signal on its very first run so that
+// setup() knows this task is alive.
+// ============================================================
+void Depth_Sensor_Task(void *pvParameters) {
+    static int firstRun = 1;
+ 
+    for (;;) {
+        struct SensorPacket packet;
+ 
+        // ── Critical section: update shared counter ───────────
+        if (xSemaphoreTake(xDataMutex, portMAX_DELAY) == pdTRUE) {
+            sensorValue++;
+            packet.sensorID = 1;
+            packet.value    = (float)sensorValue;
+            xSemaphoreGive(xDataMutex);
+        }
+ 
+        // ── Send packet to queue (outside the mutex!) ─────────
+        // Holding a mutex while blocking on a queue risks priority inversion.
+        if (xQueueSend(xROVQueue, &packet, pdMS_TO_TICKS(100)) != pdPASS) {
+            // Queue is full — add error handling or logging here if needed
+            // Serial.println("Queue full! Packet dropped.");
+        }
+ 
+        // ── Barrier signal: only on the very first execution ──
+        if (firstRun) {
+            xSemaphoreGive(xDepthSemaphore);
+            firstRun = 0;
+        }
+ 
+        // ── Wait 2 seconds before next reading ───────────────
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+}
+ 
+ 
+// ============================================================
+// TASK 2 — Pressure_Task
+// One-shot task: sends a single pressure reading, signals the
+// barrier semaphore, then deletes itself to free resources.
+// ============================================================
+void Pressure_Task(void *pvParameters) {
+    struct SensorPacket packet;
+    packet.sensorID = 2;    // Pressure sensor ID
+    packet.value    = 1.5f; // Example reading (bar / PSI)
+ 
+    xQueueSend(xROVQueue, &packet, portMAX_DELAY);
+    xSemaphoreGive(xDepthSemaphore); // Notify setup() this sensor is ready
+ 
+    vTaskDelete(NULL); // Task finished — delete itself
+}
+ 
+ 
+// ============================================================
+// TASK 3 — Temperature_Task
+// One-shot task: same pattern as Pressure_Task.
+// ============================================================
+void Temperature_Task(void *pvParameters) {
+    struct SensorPacket packet;
+    packet.sensorID = 3;     // Temperature sensor ID
+    packet.value    = 22.5f; // Example reading (°C)
+ 
+    xQueueSend(xROVQueue, &packet, portMAX_DELAY);
+    xSemaphoreGive(xDepthSemaphore); // Notify setup() this sensor is ready
+ 
+    vTaskDelete(NULL); // Task finished — delete itself
+}
+ 
+ 
+// ============================================================
+// TASK 4 — Motor_Control_Task  (lowest priority = 1)
+// Consumer task: blocks on the queue indefinitely.
+// When a packet arrives it acquires the mutex, logs the data
+// over Serial, then releases the mutex and loops back.
+// CPU is yielded while waiting — no busy-loop.
+// ============================================================
+void Motor_Control_Task(void *pvParameters) {
+    for (;;) {
+        struct SensorPacket receivedPacket;
+ 
+        // Block here until a packet is available (no CPU usage while waiting)
+        if (xQueueReceive(xROVQueue, &receivedPacket, portMAX_DELAY) == pdPASS) {
+ 
+            // Protect the Serial port with the mutex
+            if (xSemaphoreTake(xDataMutex, portMAX_DELAY) == pdTRUE) {
+                Serial.print("ROV Data Received -> Sensor [");
+                Serial.print(receivedPacket.sensorID);
+                Serial.print("] Value: ");
+                Serial.println(receivedPacket.value);
+                xSemaphoreGive(xDataMutex);
+            }
+        }
+    }
+}
+ 
+ 
+// ============================================================
+// SETUP — Runs once on boot
+// Creates all RTOS objects and tasks, then blocks until all
+// three sensors have given their ready signal.
+// ============================================================
+void setup() {
+    Serial.begin(115200);
+ 
+    // Counting semaphore: max count = 3, initial count = 0
+    // setup() will wait until all 3 sensors signal readiness.
+    xDepthSemaphore = xSemaphoreCreateCounting(3, 0);
+ 
+    // Mutex for shared resource protection
+    xDataMutex = xSemaphoreCreateMutex();
+ 
+    // Queue: holds up to 10 SensorPacket items
+    xROVQueue = xQueueCreate(10, sizeof(struct SensorPacket));
+    if (xROVQueue == NULL) {
+        Serial.println("ERROR: Queue creation failed!");
+        while (1); // Halt — cannot continue without the queue
+    }
+ 
+    // Create tasks
+    // Priority 2 → sensor producers (higher priority)
+    // Priority 1 → motor controller / consumer (lower priority)
+    xTaskCreate(Depth_Sensor_Task,  "DepthSensor", 2048, NULL, 2, NULL);
+    xTaskCreate(Motor_Control_Task, "MotorCtrl",   2048, NULL, 1, NULL);
+    xTaskCreate(Pressure_Task,      "Pressure",    2048, NULL, 2, NULL);
+    xTaskCreate(Temperature_Task,   "Temperature", 2048, NULL, 2, NULL);
+ 
+    // ── Synchronization barrier ───────────────────────────────
+    // Block setup() until all 3 sensors have signalled readiness.
+    // Each sensor task calls xSemaphoreGive(xDepthSemaphore) once.
+    for (int i = 0; i < 3; i++) {
+        xSemaphoreTake(xDepthSemaphore, portMAX_DELAY);
+    }
+ 
+    Serial.println("All sensors ready! System starting...");
+}
+ 
+ 
+// ============================================================
+// LOOP — Intentionally empty
+// FreeRTOS manages all execution via tasks.
+// Arduino's loop() still runs as the idle task context but
+// should not contain blocking code.
+// ============================================================
+void loop() {
+    // Nothing here — FreeRTOS scheduler handles everything.
+}
+ 
